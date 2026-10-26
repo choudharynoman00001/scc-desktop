@@ -40,6 +40,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: SCC-Setup, path: pkg/packaging/SCC-Setup-1.0.0-x64.exe }
       - name: Installed-EXE smoke (silent install, launch installed script, setup, login, write, stop, relaunch, readback, screenshots)
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -48,7 +49,7 @@ jobs:
           $inst = Join-Path $env:LOCALAPPDATA 'Programs\SubscriptionControlCenter'
           foreach ($f in 'runtime\node.exe','server.mjs','launcher.ps1','stop.ps1','Launch-SCC.vbs','Uninstall.exe') { if (!(Test-Path (Join-Path $inst $f))) { throw "missing installed file $f" } }
           $data = Join-Path $env:LOCALAPPDATA 'SubscriptionControlCenter\data'
-          function Launch { Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$inst\launcher.ps1`"" -WindowStyle Hidden -Wait }
+          function Launch { Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$inst\launcher.ps1`"" -WindowStyle Hidden }
           function WaitHealth($up) { for ($i=0;$i -lt 60;$i++) { try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4190/api/health -TimeoutSec 2; if ($up -and $r.StatusCode -eq 200) { return } } catch { if (-not $up) { return } }; Start-Sleep -Milliseconds 500 }; throw "health state not reached up=$up" }
           Launch; WaitHealth $true
           $tok = (Get-Content (Join-Path $data 'setup.token')).Trim()
