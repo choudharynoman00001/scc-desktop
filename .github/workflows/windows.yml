@@ -1,6 +1,7 @@
 # Installer-only repo. Builds the Windows installer on GitHub's free windows-latest runner (manual dispatch).
 name: windows-installer
 on: { workflow_dispatch: {} }
+permissions: { contents: write }
 jobs:
   build:
     runs-on: windows-latest
@@ -38,3 +39,9 @@ jobs:
       - run: '& "C:\Program Files (x86)\NSIS\makensis.exe" pkg\packaging\scc.nsi'
       - uses: actions/upload-artifact@v4
         with: { name: SCC-Setup, path: pkg/packaging/SCC-Setup-1.0.0-x64.exe }
+      - name: Publish installer as a GitHub release (automatic GITHUB_TOKEN only)
+        shell: pwsh
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          $tag = "v1.0.0-build${{ github.run_number }}"
+          gh release create $tag pkg/packaging/SCC-Setup-1.0.0-x64.exe --repo ${{ github.repository }} --title "Subscription Control Center installer $tag" --notes "Unsigned Windows installer (Windows may show a SmartScreen warning). Developed by Chaudhry Noman - Powered by Alpha Blue Digital (https://alphablue.digital). Smoke-tested on a GitHub Windows runner only."
