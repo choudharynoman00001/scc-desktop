@@ -39,9 +39,55 @@ jobs:
       - run: '& "C:\Program Files (x86)\NSIS\makensis.exe" pkg\packaging\scc.nsi'
       - uses: actions/upload-artifact@v4
         with: { name: SCC-Setup, path: pkg/packaging/SCC-Setup-1.0.0-x64.exe }
-      - name: Publish installer as a GitHub release (automatic GITHUB_TOKEN only)
+      - name: Installed-EXE smoke (silent install, launch installed script, setup, login, write, stop, relaunch, readback, screenshots)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path pkg/packaging/SCC-Setup-1.0.0-x64.exe).Path
+          Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+          $inst = Join-Path $env:LOCALAPPDATA 'Programs\SubscriptionControlCenter'
+          foreach ($f in 'runtime\node.exe','server.mjs','launcher.ps1','stop.ps1','Launch-SCC.vbs','Uninstall.exe') { if (!(Test-Path (Join-Path $inst $f))) { throw "missing installed file $f" } }
+          $data = Join-Path $env:LOCALAPPDATA 'SubscriptionControlCenter\data'
+          function Launch { Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$inst\launcher.ps1`"" -WindowStyle Hidden -Wait }
+          function WaitHealth($up) { for ($i=0;$i -lt 60;$i++) { try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4190/api/health -TimeoutSec 2; if ($up -and $r.StatusCode -eq 200) { return } } catch { if (-not $up) { return } }; Start-Sleep -Milliseconds 500 }; throw "health state not reached up=$up" }
+          Launch; WaitHealth $true
+          $tok = (Get-Content (Join-Path $data 'setup.token')).Trim()
+          $b = @{ setup_token=$tok; name='Smoke Owner'; email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json
+          Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body $b http://127.0.0.1:4190/api/setup | Out-Null
+          $sess = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $l = Invoke-RestMethod -Method Post -ContentType 'application/json' -Body (@{ email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json) -WebSession $sess http://127.0.0.1:4190/api/login
+          $h = @{ 'x-csrf' = $l.csrf }
+          Invoke-RestMethod -Method Post -ContentType 'application/json' -Headers $h -Body (@{ name='Installed Smoke Customer' } | ConvertTo-Json) -WebSession $sess http://127.0.0.1:4190/api/customers | Out-Null
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\stop.ps1"
+          WaitHealth $false
+          Launch; WaitHealth $true
+          $sess2 = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $l2 = Invoke-RestMethod -Method Post -ContentType 'application/json' -Body (@{ email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json) -WebSession $sess2 http://127.0.0.1:4190/api/login
+          $cs = Invoke-RestMethod -Headers @{ 'x-csrf' = $l2.csrf } -WebSession $sess2 http://127.0.0.1:4190/api/customers
+          if (-not ($cs | Where-Object { $_.name -eq 'Installed Smoke Customer' })) { throw 'readback after relaunch failed' }
+          "installed smoke OK: install, launch, setup, login, write, stop, relaunch, readback" | Tee-Object shots-note.txt
+          $js = @'
+          const { spawn } = require('child_process'); const fs = require('fs');
+          (async () => {
+            const chrome = spawn('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', ['--headless=new','--disable-gpu','--remote-debugging-port=9444','--user-data-dir=' + process.env.TEMP + '\\cp','about:blank'], { stdio: 'ignore' });
+            for (let i=0;i<60;i++){ try { await fetch('http://127.0.0.1:9444/json'); break; } catch { await new Promise(r=>setTimeout(r,500)); } }
+            const tabs = await (await fetch('http://127.0.0.1:9444/json')).json(); const ws = new WebSocket(tabs.find(t=>t.type==='page').webSocketDebuggerUrl); await new Promise(r=>ws.onopen=r);
+            let id=0; const pend=new Map(); ws.onmessage=m=>{const d=JSON.parse(m.data); if(d.id&&pend.has(d.id)){pend.get(d.id)(d);pend.delete(d.id);}};
+            const cdp=(method,params={})=>new Promise(r=>{const i=++id;pend.set(i,r);ws.send(JSON.stringify({id:i,method,params}));});
+            const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+            await cdp('Page.enable'); await cdp('Page.navigate',{url:'http://127.0.0.1:4190/'}); await sleep(2500);
+            await cdp('Runtime.evaluate',{expression:"(()=>{const f=document.querySelector('form');f.email.value='owner@smoke.test';f.password.value='smoke-password-123';f.requestSubmit()})()"}); await sleep(2500);
+            for (const [n,w,h] of [['installed-dashboard-1280',1280,800],['installed-dashboard-390',390,800]]) { await cdp('Emulation.setDeviceMetricsOverride',{width:w,height:h,deviceScaleFactor:1,mobile:w<600}); await sleep(800); const r=await cdp('Page.captureScreenshot',{format:'png'}); fs.writeFileSync(n+'.png',Buffer.from(r.result.data,'base64')); }
+            ws.close(); chrome.kill(); process.exit(0);
+          })();
+          '@
+          Set-Content -Path shot.cjs -Value $js
+          & "$inst\runtime\node.exe" shot.cjs
+          if (!(Test-Path installed-dashboard-1280.png)) { throw 'screenshot missing' }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\stop.ps1"
+      - name: Publish installer + installed-UI screenshots as a GitHub release (automatic GITHUB_TOKEN only)
         shell: pwsh
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           $tag = "v1.0.0-build${{ github.run_number }}"
-          gh release create $tag pkg/packaging/SCC-Setup-1.0.0-x64.exe --repo ${{ github.repository }} --title "Subscription Control Center installer $tag" --notes "Unsigned Windows installer (Windows may show a SmartScreen warning). Developed by Chaudhry Noman - Powered by Alpha Blue Digital (https://alphablue.digital). Smoke-tested on a GitHub Windows runner only."
+          gh release create $tag pkg/packaging/SCC-Setup-1.0.0-x64.exe installed-dashboard-1280.png installed-dashboard-390.png --repo ${{ github.repository }} --title "Subscription Control Center installer $tag" --notes "Unsigned Windows installer (SmartScreen may warn). Installed-EXE smoke on a GitHub Windows runner passed before this release was created; not tested on a physical PC. Developed by Chaudhry Noman - Powered by Alpha Blue Digital (https://alphablue.digital)."
