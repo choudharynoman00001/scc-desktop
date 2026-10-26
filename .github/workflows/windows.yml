@@ -55,7 +55,14 @@ jobs:
           $lf = Join-Path $data 'last-launch.txt'; for ($k=0;$k -lt 40 -and -not (Test-Path $lf);$k++) { Start-Sleep -Milliseconds 500 }; $ll = (Get-Content $lf -Raw).Trim()
           if ($ll -notmatch '^app-window: .*(msedge|chrome)\.exe.* --app=http://localhost:4190$') { throw "launcher did not select app-window mode: $ll" }
           "launcher selection (log-only, nothing opened): $ll" | Tee-Object shots-note.txt -Append
-          try { $env:SCC_LAUNCH_LOG_ONLY = '0'; $exe = ($ll -replace '^app-window: "([^"]+)".*$','$1'); $ap = Start-Process -FilePath $exe -ArgumentList '--app=http://localhost:4190' -PassThru; Start-Sleep -Seconds 6; $pc = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '--app=http://localhost:4190' }; if ($pc) { "real app-mode process started on runner: $(@($pc).Count) process(es) with --app=http://localhost:4190 (window chrome NOT pixel-verified)" | Tee-Object shots-note.txt -Append } else { "app-mode process not observed on runner (not fatal)" | Tee-Object shots-note.txt -Append }; $pc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } catch { "app-mode real launch check error (not fatal): $($_.Exception.Message)" | Tee-Object shots-note.txt -Append }
+          $env:SCC_LAUNCH_LOG_ONLY = '0'
+          $exe = ($ll -replace '^app-window: "([^"]+)".*$','$1'); $prof = Join-Path $env:RUNNER_TEMP ('scc-appmode-' + [guid]::NewGuid().ToString('N'))
+          $before = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '--app=http://localhost:4190' } | ForEach-Object { $_.ProcessId })
+          $env:SCC_APP_TEST_PROFILE = $prof; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\launcher.ps1"; $env:SCC_APP_TEST_PROFILE = ''
+          $own = @(); for ($k=0;$k -lt 30 -and $own.Count -eq 0;$k++) { Start-Sleep -Milliseconds 500; $own = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $prof + '*') -and $_.CommandLine -match '--app=http://localhost:4190' -and ($before -notcontains $_.ProcessId) }) }
+          if ($own.Count -eq 0) { throw 'REQUIRED check failed: no owned browser process with --app=http://localhost:4190 and the unique test profile was observed' }
+          "real app-mode launch on runner via the installed launcher.ps1 (SCC_APP_TEST_PROFILE adds only a unique test profile for ownership): $($own.Count) owned process(es), before-set had $($before.Count), unique test profile, command line contains --app=http://localhost:4190 (window chrome/title/icon NOT pixel-verified)" | Tee-Object shots-note.txt -Append
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $prof + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           $env:SCC_LAUNCH_LOG_ONLY = '1'
           $tok = (Get-Content (Join-Path $data 'setup.token')).Trim()
           $b = @{ setup_token=$tok; name='Smoke Owner'; email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json
