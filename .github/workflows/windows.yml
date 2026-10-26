@@ -1,0 +1,40 @@
+# Installer-only repo. Builds the Windows installer on GitHub's free windows-latest runner (manual dispatch).
+name: windows-installer
+on: { workflow_dispatch: {} }
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.13.0' }
+      - name: Stage app with bundled Node runtime
+        shell: pwsh
+        run: |
+          Expand-Archive (Get-ChildItem -Filter "*scc-runtime*.zip" | Select-Object -First 1).FullName -DestinationPath pkg
+          New-Item -ItemType Directory -Force pkg/packaging/stage/runtime | Out-Null
+          Copy-Item (Get-Command node).Source pkg/packaging/stage/runtime/node.exe
+          Copy-Item pkg/server.mjs,pkg/lib,pkg/public -Destination pkg/packaging/stage -Recurse
+          Copy-Item pkg/packaging/launcher.ps1,pkg/packaging/stop.ps1,pkg/packaging/Launch-SCC.vbs -Destination pkg/packaging/stage
+      - name: Smoke - start, health, first-run setup, restart keeps data
+        shell: pwsh
+        run: |
+          $env:SCC_DATA="$PWD/smoke-data"; $env:PORT='4191'; $env:SCC_SETUP_TOKEN='smoketoken'
+          function Start-App { Start-Process pkg/packaging/stage/runtime/node.exe -ArgumentList 'pkg/packaging/stage/server.mjs' -PassThru -WindowStyle Hidden }
+          $p = Start-App; Start-Sleep 5
+          $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4191/
+          if ($r.Content -notmatch 'Subscription Control Center') { throw 'page failed' }
+          $h = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4191/api/health
+          if ($h.StatusCode -ne 200) { throw 'health failed' }
+          $b = @{ setup_token='smoketoken'; name='Smoke'; email='s@smoke.test'; password='smoke-password-123' } | ConvertTo-Json
+          $s = Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body $b http://127.0.0.1:4191/api/setup
+          if ($s.StatusCode -ne 200) { throw 'setup failed' }
+          Stop-Process $p.Id; Start-Sleep 2
+          $p = Start-App; Start-Sleep 5
+          $l = Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body (@{email='s@smoke.test';password='smoke-password-123'} | ConvertTo-Json) http://127.0.0.1:4191/api/login
+          if ($l.StatusCode -ne 200) { throw 'login after restart failed' }
+          Stop-Process $p.Id
+      - run: choco install nsis -y --no-progress
+      - run: '& "C:\Program Files (x86)\NSIS\makensis.exe" pkg\packaging\scc.nsi'
+      - uses: actions/upload-artifact@v4
+        with: { name: SCC-Setup, path: pkg/packaging/SCC-Setup-1.0.0-x64.exe }
