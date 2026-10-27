@@ -1,0 +1,302 @@
+# SCC Windows installer BOUNDED TEST (candidate v3). Manual dispatch only.
+# Builds + smokes + verifies install/uninstall SAFETY of scc-v5.nsi. Publishes NOTHING:
+# permissions are read-only and the only output is a 3-day workflow artifact.
+# v1 scc.nsi is archival and is never selected. No release, no tags, no branch writes.
+name: windows-installer-bounded-test
+on: { workflow_dispatch: {} }
+permissions: { contents: read }
+env:
+  # the zip must sit at the repo root under this EXACT name when uploaded (no attachment hash suffix)
+  RUNTIME_ZIP: 17-scc-runtime-v1.0.zip
+  RUNTIME_ZIP_SHA256: 4d0b744a3ba81d7caec4fb7fb54ac29705838fcf0b6df7626410fb25723517e6
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout (no credentials persisted)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false }
+      - name: Setup Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: '22.13.0' }
+      - name: Fetch EXACT pinned runtime zip and verify its SHA256
+        shell: pwsh
+        run: |
+          if (!(Test-Path $env:RUNTIME_ZIP)) { throw "pinned runtime zip $env:RUNTIME_ZIP missing at repo root" }
+          $actual = (Get-FileHash $env:RUNTIME_ZIP -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:RUNTIME_ZIP_SHA256.ToLower()) { throw "runtime zip SHA256 mismatch: $actual" }
+          "runtime_zip=$env:RUNTIME_ZIP" | Out-File provenance.txt
+          "runtime_zip_sha256=$actual" | Out-File provenance.txt -Append
+          Expand-Archive $env:RUNTIME_ZIP -DestinationPath pkg
+          New-Item -ItemType Directory -Force pkg/packaging/stage/runtime | Out-Null
+          Copy-Item (Get-Command node).Source pkg/packaging/stage/runtime/node.exe
+          Copy-Item pkg/server.mjs,pkg/lib,pkg/public -Destination pkg/packaging/stage -Recurse
+          Copy-Item pkg/packaging/launcher.ps1,pkg/packaging/stop.ps1,pkg/packaging/Launch-SCC.vbs -Destination pkg/packaging/stage
+      - name: Generate compile-time owned-file Delete include (drives the uninstaller)
+        shell: pwsh
+        run: |
+          $stage = (Resolve-Path pkg/packaging/stage).Path
+          $files = Get-ChildItem -Recurse -File $stage | ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
+          if ($files.Count -lt 10) { throw "owned list suspiciously small: $($files.Count)" }
+          foreach ($f in $files) {
+            if ($f -match '[\"''`$]' -or $f -match '\.\.' -or $f -match '[*?]' -or $f -match '^[A-Za-z]:' -or $f.StartsWith('\')) { throw "unsafe staged filename (quote/dollar/wildcard/traversal/absolute): $f" }
+          }
+          $lines = $files | ForEach-Object { 'Delete "$INSTDIR\' + $_ + '"' }
+          foreach ($l in $lines) { if ($l -notmatch '^Delete "\$INSTDIR\\[^"]+"$') { throw "generated Delete line not closed/exact: $l" } }
+          [IO.File]::WriteAllLines((Join-Path (Resolve-Path pkg/packaging).Path 'uninstall-files.nsh'), $lines)
+          "owned_delete_lines=$($files.Count)" | Out-File provenance.txt -Append
+      - name: Smoke - start, health, first-run setup, restart keeps data
+        shell: pwsh
+        run: |
+          $env:SCC_DATA="$PWD/smoke-data"; $env:PORT='4191'; $env:SCC_SETUP_TOKEN='smoketoken'
+          function Start-App { Start-Process pkg/packaging/stage/runtime/node.exe -ArgumentList 'pkg/packaging/stage/server.mjs' -PassThru -WindowStyle Hidden }
+          $p = Start-App; Start-Sleep 5
+          $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4191/
+          if ($r.Content -notmatch 'Subscription Control Center') { throw 'page failed' }
+          $h = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4191/api/health
+          if ($h.StatusCode -ne 200) { throw 'health failed' }
+          $b = @{ setup_token='smoketoken'; name='Smoke'; email='s@smoke.test'; password='smoke-password-123' } | ConvertTo-Json
+          $s = Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body $b http://127.0.0.1:4191/api/setup
+          if ($s.StatusCode -ne 200) { throw 'setup failed' }
+          Stop-Process $p.Id; Start-Sleep 2
+          $p = Start-App; Start-Sleep 5
+          $l = Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body (@{email='s@smoke.test';password='smoke-password-123'} | ConvertTo-Json) http://127.0.0.1:4191/api/login
+          if ($l.StatusCode -ne 200) { throw 'login after restart failed' }
+          Stop-Process $p.Id
+      - name: Extract vendored NSIS 3.13 (pinned unmodified binary; zero external downloads) and verify compiler provenance
+        shell: pwsh
+        run: |
+          # Transport: the compiler ships INSIDE the checkout as the unmodified vendor file nsis-3.13-setup.exe
+          # at the repo root (a third exact bounded-arc path, deleted in cleanup). No download at run time,
+          # so the SourceForge interstitial class that killed run 40464068842 is eliminated by construction.
+          # Provenance of the vendored file:
+          #   origin:  https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13-setup.exe
+          #            (vendor project file; SourceForge feed lists MD5 fc89531a76bdfd648bcff120c6fab0c7, size 1,567,985)
+          #   license: NSIS is free software - core/plugins zlib/libpng, bzip2 module bzip2 license,
+          #            LZMA module CPL-1.0 with the authors' linking exception; unmodified binary
+          #            redistribution is permitted with notices kept (COPYING travels inside the archive).
+          #   the file is NOT modified, rewrapped or repacked in any way.
+          $f = 'nsis-3.13-setup.exe'
+          if (!(Test-Path $f)) { throw 'vendored nsis-3.13-setup.exe missing at repo root' }
+          $sz = (Get-Item $f).Length
+          if ($sz -ne 1567985) { throw "setup size mismatch: $sz" }
+          if ((Get-FileHash $f -Algorithm MD5).Hash -ne 'FC89531A76BDFD648BCFF120C6FAB0C7') { throw 'setup MD5 mismatch (vendor pin)' }
+          if ((Get-FileHash $f -Algorithm SHA256).Hash -ne 'DB9A1038BBC0E53FEF24F423FD609979BD578E942F1BE1198DB186D1C42652A3') { throw 'setup SHA256 mismatch' }
+          "nsis_setup_origin=https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13-setup.exe" | Out-File provenance.txt -Append
+          "nsis_setup_sha256=DB9A1038BBC0E53FEF24F423FD609979BD578E942F1BE1198DB186D1C42652A3" | Out-File provenance.txt -Append
+          "nsis_license=NSIS free software: zlib/libpng core, bzip2 module, LZMA CPL-1.0 with linking exception; unmodified redistribution, COPYING included" | Out-File provenance.txt -Append
+          7z x $f "-o$env:RUNNER_TEMP\nsis313" | Out-Null
+          $mk = "$env:RUNNER_TEMP\nsis313\makensis.exe"
+          if (!(Test-Path $mk)) { throw 'makensis.exe missing after extraction' }
+          if (!(Test-Path "$env:RUNNER_TEMP\nsis313\COPYING")) { throw 'COPYING notice missing after extraction (notices must stay intact)' }
+          "makensis_path=$mk" | Out-File makensis-path.txt
+          $mksha = (Get-FileHash $mk -Algorithm SHA256).Hash
+          # pinned: observed checksum of makensis.exe inside the dual-hash-verified nsis-3.13-setup.exe
+          if ($mksha -ne '4EC390D0F96F9728507FBC2F4E91311DD90BFC6C8DDFE2159357B3651AE151C0') { throw "makensis.exe SHA256 mismatch: $mksha" }
+          "makensis_sha256=$mksha" | Out-File provenance.txt -Append
+          $sig = Get-AuthenticodeSignature $mk
+          "makensis_signature_status=$($sig.Status) (informational only; no vendor signing documented)" | Out-File provenance.txt -Append
+
+      - name: Build installer (scc-v5.nsi ONLY; v1 archival nsi never selected)
+        shell: pwsh
+        run: '& (Get-Content makensis-path.txt | Select-Object -First 1).Replace("makensis_path=","") pkg\packaging\scc-v5.nsi'
+      - name: Installer artifact exists
+        shell: pwsh
+        run: |
+          $exe = 'pkg/packaging/SCC-Setup-1.0.0-x64.exe'
+          if (!(Test-Path $exe)) { throw 'installer EXE missing' }
+          "installer_sha256=$((Get-FileHash $exe -Algorithm SHA256).Hash)" | Out-File provenance.txt -Append
+      - name: Installed-EXE smoke (install, launch, setup, write, stop, relaunch, readback, app-mode process)
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path pkg/packaging/SCC-Setup-1.0.0-x64.exe).Path
+          Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+          $inst = Join-Path $env:LOCALAPPDATA 'Programs\SubscriptionControlCenter'
+          foreach ($f in 'runtime\node.exe','server.mjs','launcher.ps1','stop.ps1','Launch-SCC.vbs','Uninstall.exe','scc-owned.marker') { if (!(Test-Path (Join-Path $inst $f))) { throw "missing installed file $f" } }
+          $data = Join-Path $env:LOCALAPPDATA 'SubscriptionControlCenter\data'
+          function Launch { $env:SCC_LAUNCH_LOG_ONLY = '1'; Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$inst\launcher.ps1`"" -WindowStyle Hidden }
+          function WaitHealth($up) { for ($i=0;$i -lt 60;$i++) { try { $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:4190/api/health -TimeoutSec 2; if ($up -and $r.StatusCode -eq 200) { return } } catch { if (-not $up) { return } }; Start-Sleep -Milliseconds 500 }; throw "health state not reached up=$up" }
+          Launch; WaitHealth $true
+          $lf = Join-Path $data 'last-launch.txt'; for ($k=0;$k -lt 40 -and -not (Test-Path $lf);$k++) { Start-Sleep -Milliseconds 500 }; $ll = (Get-Content $lf -Raw).Trim()
+          if ($ll -notmatch '^app-window: .*(msedge|chrome)\.exe.* --app=http://localhost:4190$') { throw "launcher did not select app-window mode: $ll" }
+          "launcher selection (log-only, nothing opened): $ll" | Tee-Object shots-note.txt -Append
+          $env:SCC_LAUNCH_LOG_ONLY = '0'
+          $prof = Join-Path $env:RUNNER_TEMP ('scc-appmode-' + [guid]::NewGuid().ToString('N'))
+          $before = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '--app=http://localhost:4190' } | ForEach-Object { $_.ProcessId })
+          $env:SCC_APP_TEST_PROFILE = $prof; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\launcher.ps1"; $env:SCC_APP_TEST_PROFILE = ''
+          $own = @(); for ($k=0;$k -lt 30 -and $own.Count -eq 0;$k++) { Start-Sleep -Milliseconds 500; $own = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $prof + '*') -and $_.CommandLine -match '--app=http://localhost:4190' -and ($before -notcontains $_.ProcessId) }) }
+          if ($own.Count -eq 0) { throw 'REQUIRED check failed: no owned browser process with --app=http://localhost:4190 and the unique test profile was observed' }
+          "real app-mode launch verified via owned process + unique test profile (window chrome NOT pixel-verified): $($own.Count) process(es)" | Tee-Object shots-note.txt -Append
+          Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $prof + '*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          $env:SCC_LAUNCH_LOG_ONLY = '1'
+          $tok = (Get-Content (Join-Path $data 'setup.token')).Trim()
+          $b = @{ setup_token=$tok; name='Smoke Owner'; email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json
+          Invoke-WebRequest -UseBasicParsing -Method Post -ContentType 'application/json' -Body $b http://127.0.0.1:4190/api/setup | Out-Null
+          $sess = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $l = Invoke-RestMethod -Method Post -ContentType 'application/json' -Body (@{ email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json) -WebSession $sess http://127.0.0.1:4190/api/login
+          $h = @{ 'x-csrf' = $l.csrf }
+          Invoke-RestMethod -Method Post -ContentType 'application/json' -Headers $h -Body (@{ name='Installed Smoke Customer' } | ConvertTo-Json) -WebSession $sess http://127.0.0.1:4190/api/customers | Out-Null
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\stop.ps1"
+          WaitHealth $false
+          Launch; WaitHealth $true
+          $sess2 = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          $l2 = Invoke-RestMethod -Method Post -ContentType 'application/json' -Body (@{ email='owner@smoke.test'; password='smoke-password-123' } | ConvertTo-Json) -WebSession $sess2 http://127.0.0.1:4190/api/login
+          $cs = Invoke-RestMethod -Headers @{ 'x-csrf' = $l2.csrf } -WebSession $sess2 http://127.0.0.1:4190/api/customers
+          if (-not ($cs | Where-Object { $_.name -eq 'Installed Smoke Customer' })) { throw 'readback after relaunch failed' }
+          "installed smoke OK: install, launch, setup, login, write, stop, relaunch, readback" | Tee-Object shots-note.txt
+      - name: HEADLESS login screenshots (emulated viewport, NOT a visible window)
+        shell: pwsh
+        run: |
+          $inst = Join-Path $env:LOCALAPPDATA 'Programs\SubscriptionControlCenter'
+          $js = @'
+          const { spawn } = require('child_process'); const fs = require('fs');
+          (async () => {
+            const chrome = spawn('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', ['--headless=new','--disable-gpu','--remote-debugging-port=9444','--user-data-dir=' + process.env.TEMP + '\\cp','about:blank'], { stdio: 'ignore' });
+            for (let i=0;i<60;i++){ try { await fetch('http://127.0.0.1:9444/json'); break; } catch { await new Promise(r=>setTimeout(r,500)); } }
+            const tabs = await (await fetch('http://127.0.0.1:9444/json')).json(); const ws = new WebSocket(tabs.find(t=>t.type==='page').webSocketDebuggerUrl); await new Promise(r=>ws.onopen=r);
+            let id=0; const pend=new Map(); ws.onmessage=m=>{const d=JSON.parse(m.data); if(d.id&&pend.has(d.id)){pend.get(d.id)(d);pend.delete(d.id);}};
+            const cdp=(method,params={})=>new Promise(r=>{const i=++id;pend.set(i,r);ws.send(JSON.stringify({id:i,method,params}));});
+            const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+            await cdp('Page.enable'); await cdp('Page.navigate',{url:'http://127.0.0.1:4190/'}); await sleep(2500);
+            for (const [n,w,h] of [['headless-login-1280',1280,800],['headless-login-390',390,800]]) { await cdp('Emulation.setDeviceMetricsOverride',{width:w,height:h,deviceScaleFactor:1,mobile:w<600}); await sleep(800); const r=await cdp('Page.captureScreenshot',{format:'png'}); fs.writeFileSync(n+'.png',Buffer.from(r.result.data,'base64')); }
+            ws.close(); chrome.kill(); process.exit(0);
+          })();
+          '@
+          Set-Content -Path shot.cjs -Value $js
+          & "$inst\runtime\node.exe" shot.cjs
+          foreach ($f in 'headless-login-1280.png','headless-login-390.png') { if (!(Test-Path $f)) { throw "screenshot missing: $f" } }
+          "headless screenshots captured: emulated 1280/390 viewports of the login screen via headless Chrome - NOT a visible window, NOT window chrome proof" | Tee-Object shots-note.txt -Append
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$inst\stop.ps1"
+      - name: Uninstall safety suite (default dir, custom dir, refusals, upgrade)
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path pkg/packaging/SCC-Setup-1.0.0-x64.exe).Path
+          $inst = Join-Path $env:LOCALAPPDATA 'Programs\SubscriptionControlCenter'
+          $data = Join-Path $env:LOCALAPPDATA 'SubscriptionControlCenter\data'
+          function Wait-Uninstall($dir) {
+            Start-Process -FilePath (Join-Path $dir 'Uninstall.exe') -ArgumentList '/S'
+            $gone = $false
+            for ($i=0; $i -lt 60; $i++) { if (!(Test-Path (Join-Path $dir 'scc-owned.marker'))) { $gone = $true; break }; Start-Sleep -Milliseconds 500 }
+            if (-not $gone) { throw "uninstall did not reach marker delete within 30s (marker still present)" }
+            # marker is deleted last of the OWNED list, but Uninstall.exe delete + RMDir still follow:
+            # also wait for the real worker (temp-copy) process to exit and finish the tail
+            $done = $false
+            for ($i=0; $i -lt 60; $i++) {
+              $alive = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -like ($env:TEMP + '*') -and $_.Name -match '^A[Uu]_|^B[Uu]_|uninstall' }).Count
+              if ($alive -eq 0 -and !(Test-Path (Join-Path $dir 'Uninstall.exe'))) { $done = $true; break }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $done) { throw "uninstall tail incomplete within 30s after marker delete (worker alive or Uninstall.exe still present)" }
+          }
+          # A. default dir: foreign file + foreign subdir + data survive, owned removed
+          Set-Content (Join-Path $inst 'foreign-keep.txt') 'must survive'
+          New-Item -ItemType Directory -Force (Join-Path $inst 'foreign-dir') | Out-Null
+          Set-Content (Join-Path $inst 'foreign-dir\keep.txt') 'must survive'
+          Wait-Uninstall $inst
+          if (Test-Path (Join-Path $inst 'runtime\node.exe')) { throw 'owned runtime NOT removed' }
+          if (!(Test-Path (Join-Path $inst 'foreign-keep.txt'))) { throw 'SAFETY FAIL: foreign file deleted' }
+          if (!(Test-Path (Join-Path $inst 'foreign-dir\keep.txt'))) { throw 'SAFETY FAIL: foreign subdir deleted' }
+          if (!(Test-Path $data)) { throw 'SAFETY FAIL: data dir deleted' }
+          "uninstall A OK: owned removed, foreign+data survived (default dir)" | Tee-Object shots-note.txt -Append
+          # B. custom dir install + uninstall
+          $cust = Join-Path $env:RUNNER_TEMP 'scc-custom'
+          Start-Process -FilePath $exe -ArgumentList '/S',"/D=$cust" -Wait
+          if (!(Test-Path (Join-Path $cust 'server.mjs'))) { throw 'custom-dir install failed' }
+          Set-Content (Join-Path $cust 'foreign-custom.txt') 'must survive'
+          Wait-Uninstall $cust
+          if (!(Test-Path (Join-Path $cust 'foreign-custom.txt'))) { throw 'SAFETY FAIL: custom-dir foreign file deleted' }
+          "uninstall B OK: custom dir" | Tee-Object shots-note.txt -Append
+          # C. occupied foreign dir refusal (exit 2 via .onInit validation), nothing written
+          $occ = Join-Path $env:RUNNER_TEMP 'scc-occupied'
+          New-Item -ItemType Directory -Force $occ | Out-Null
+          Set-Content (Join-Path $occ 'other-app.txt') 'existing'
+          $p = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$occ" -Wait -PassThru
+          if ($p.ExitCode -ne 2) { throw "occupied-dir refusal exit expected 2, got $($p.ExitCode)" }
+          if (Test-Path (Join-Path $occ 'server.mjs')) { throw 'SAFETY FAIL: wrote into occupied foreign dir' }
+          if (!(Test-Path (Join-Path $occ 'other-app.txt'))) { throw 'SAFETY FAIL: occupied dir contents lost' }
+          "refusal C OK: occupied foreign dir rejected with exit 2, untouched" | Tee-Object shots-note.txt -Append
+          # D. protected descendant refusal (exit 2), nothing written
+          $prot = 'C:\Windows\scc-should-not-install'
+          $p = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$prot" -Wait -PassThru
+          if ($p.ExitCode -ne 2) { throw "protected-dir refusal exit expected 2, got $($p.ExitCode)" }
+          if (Test-Path $prot) { throw 'SAFETY FAIL: created folder under Windows' }
+          "refusal D OK: protected descendant rejected with exit 2" | Tee-Object shots-note.txt -Append
+          # E. uninstaller refuses a marker-less dir (exit 4), files intact
+          $nm = Join-Path $env:RUNNER_TEMP 'scc-nomarker'
+          Start-Process -FilePath $exe -ArgumentList '/S',"/D=$nm" -Wait
+          Remove-Item (Join-Path $nm 'scc-owned.marker')
+          $pu = Start-Process -FilePath (Join-Path $nm 'Uninstall.exe') -ArgumentList '/S',"_?=$nm" -Wait -PassThru
+          if ($pu.ExitCode -ne 4) { throw "marker-less refusal exit expected 4, got $($pu.ExitCode)" }
+          if (!(Test-Path (Join-Path $nm 'server.mjs'))) { throw 'SAFETY FAIL: marker-less dir was uninstalled' }
+          "refusal E OK: uninstaller refused marker-less dir with genuine exit 4 (_?= in-place), files intact" | Tee-Object shots-note.txt -Append
+          # G. inner junction on a FRESH verified install (E removed the marker, so reinstall first):
+          # replace lib with a junction to a foreign dir -> uninstall must REFUSE at the junction gate
+          Remove-Item $nm -Recurse -Force
+          $pg = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$nm" -Wait -PassThru
+          if ($pg.ExitCode -ne 0) { throw "fresh install for G failed, exit $($pg.ExitCode)" }
+          if (!(Test-Path (Join-Path $nm 'scc-owned.marker'))) { throw 'fresh install for G has no marker' }
+          $fj = Join-Path $env:RUNNER_TEMP 'scc-foreign-junction-target'
+          New-Item -ItemType Directory -Force $fj | Out-Null
+          Set-Content (Join-Path $fj 'db.mjs') 'foreign content that must survive'
+          Remove-Item (Join-Path $nm 'lib') -Recurse -Force
+          New-Item -ItemType Junction -Path (Join-Path $nm 'lib') -Target $fj | Out-Null
+          $pj = Start-Process -FilePath (Join-Path $nm 'Uninstall.exe') -ArgumentList '/S',"_?=$nm" -Wait -PassThru
+          if ($pj.ExitCode -ne 5) { throw "junction refusal exit expected 5, got $($pj.ExitCode)" }
+          if (!(Test-Path (Join-Path $fj 'db.mjs'))) { throw 'SAFETY FAIL: delete-through-junction removed a foreign file' }
+          if (!(Test-Path (Join-Path $nm 'scc-owned.marker'))) { throw 'junction refusal expected to abort BEFORE deletes, but marker is gone' }
+          "refusal G OK: inner junction -> genuine exit 5 (_?= in-place), foreign file survived, marker intact" | Tee-Object shots-note.txt -Append
+          # H. install through ROOT junction must REFUSE (exit 5), foreign target unchanged
+          $fh = Join-Path $env:RUNNER_TEMP 'scc-foreign-root-target'
+          New-Item -ItemType Directory -Force $fh | Out-Null
+          $jh = Join-Path $env:RUNNER_TEMP 'scc-root-junction'
+          New-Item -ItemType Junction -Path $jh -Target $fh | Out-Null
+          $ph = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$jh" -Wait -PassThru
+          if ($ph.ExitCode -ne 5) { throw "root-junction install refusal exit expected 5, got $($ph.ExitCode)" }
+          if (@(Get-ChildItem -Force $fh).Count -ne 0) { throw 'SAFETY FAIL: install wrote through root junction into foreign dir' }
+          "refusal H OK: root junction install refused with exit 5, foreign target unchanged" | Tee-Object shots-note.txt -Append
+          # I. install with INNER pre-existing junction (marker present so dir counts as ours) must REFUSE, foreign file unchanged
+          $fi = Join-Path $env:RUNNER_TEMP 'scc-foreign-inner-target'
+          New-Item -ItemType Directory -Force $fi | Out-Null
+          Set-Content (Join-Path $fi 'sentinel.txt') 'must survive install'
+          $ii = Join-Path $env:RUNNER_TEMP 'scc-inner-junction-install'
+          New-Item -ItemType Directory -Force $ii | Out-Null
+          Set-Content (Join-Path $ii 'scc-owned.marker') 'SubscriptionControlCenter/1.0 owned-install'
+          New-Item -ItemType Junction -Path (Join-Path $ii 'lib') -Target $fi | Out-Null
+          $pi = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$ii" -Wait -PassThru
+          if ($pi.ExitCode -ne 5) { throw "inner-junction install refusal exit expected 5, got $($pi.ExitCode)" }
+          if (!(Test-Path (Join-Path $fi 'sentinel.txt'))) { throw 'SAFETY FAIL: foreign file lost during inner-junction install' }
+          if (@(Get-ChildItem -Force $fi).Count -ne 1) { throw 'SAFETY FAIL: install wrote through inner junction into foreign dir' }
+          if (Test-Path (Join-Path $ii 'server.mjs')) { throw 'inner-junction refusal expected to abort BEFORE writes, but server.mjs exists' }
+          "refusal I OK: inner junction install refused with exit 5, foreign target unchanged, nothing written" | Tee-Object shots-note.txt -Append
+          # F. legacy upgrade path on a SEPARATE fixture: v1-style dir (strong fingerprint: all four
+          # files, NO marker, NO junction) -> install must succeed, overwrite the legacy payload, write a marker
+          $leg = Join-Path $env:RUNNER_TEMP 'scc-legacy-upgrade'
+          New-Item -ItemType Directory -Force (Join-Path $leg 'runtime'),(Join-Path $leg 'lib'),(Join-Path $leg 'public') | Out-Null
+          Set-Content (Join-Path $leg 'server.mjs') 'legacy v1 content'
+          Set-Content (Join-Path $leg 'runtime\node.exe') 'legacy v1 content'
+          Set-Content (Join-Path $leg 'lib\db.mjs') 'legacy v1 content'
+          Set-Content (Join-Path $leg 'public\ab-icon.png') 'legacy v1 content'
+          $pf = Start-Process -FilePath $exe -ArgumentList '/S',"/D=$leg" -Wait -PassThru
+          if ($pf.ExitCode -ne 0) { throw "legacy upgrade install exit expected 0, got $($pf.ExitCode)" }
+          if ((Get-Content (Join-Path $leg 'server.mjs') -Raw) -match 'legacy v1 content') { throw 'upgrade did not replace the legacy payload' }
+          if (!(Test-Path (Join-Path $leg 'scc-owned.marker'))) { throw 'upgrade did not write a new marker' }
+          "upgrade F OK: legacy fingerprint dir upgraded - exit 0, payload replaced, marker written (no junction involved)" | Tee-Object shots-note.txt -Append
+      - name: Bounded artifact (no publication) - every path must exist
+        shell: pwsh
+        run: |
+          foreach ($f in 'pkg/packaging/SCC-Setup-1.0.0-x64.exe','shots-note.txt','provenance.txt','headless-login-1280.png','headless-login-390.png') { if (!(Test-Path $f)) { throw "artifact input missing: $f" } }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SCC-bounded-test
+          path: |
+            pkg/packaging/SCC-Setup-1.0.0-x64.exe
+            headless-login-1280.png
+            headless-login-390.png
+            shots-note.txt
+            provenance.txt
+          retention-days: 3
